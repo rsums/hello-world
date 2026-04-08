@@ -1,6 +1,6 @@
 # Substack Archive Extractor
 
-Extract a Substack publication's posts and notes archive (with engagement data) to CSV.
+Extract one or more Substack publications' posts and notes archive (with engagement data) to CSV. Each user gets a separate output folder with their own CSVs.
 
 ## Setup
 
@@ -21,12 +21,15 @@ Pass it via `--cookie` flag or `SUBSTACK_SID` environment variable.
 ## Usage
 
 ```bash
-# Extract everything (posts + notes)
+# Extract a single user
 python extract.py mattstoller --cookie "s%3A..."
+
+# Extract multiple users at once (separate CSVs per user)
+python extract.py mattstoller platformer slow-boring --cookie "s%3A..."
 
 # Using environment variable
 export SUBSTACK_SID="s%3A..."
-python extract.py mattstoller
+python extract.py mattstoller platformer
 
 # Posts only, no body content (metadata + engagement only)
 python extract.py mattstoller --posts-only --no-content
@@ -35,22 +38,34 @@ python extract.py mattstoller --posts-only --no-content
 python extract.py mattstoller --notes-only
 
 # Custom output directory and request delay
-python extract.py mattstoller --output-dir ./my-archive --delay 2.0
+python extract.py mattstoller platformer --output-dir ./my-archive --delay 2.0
+```
+
+## Output Structure
+
+```
+output/
+  mattstoller/
+    posts.csv
+    notes.csv
+  platformer/
+    posts.csv
+    notes.csv
 ```
 
 ## Options
 
 | Flag | Description | Default |
 |---|---|---|
-| `subdomain` | Substack subdomain (e.g. `mattstoller`) | required |
+| `subdomains` | One or more Substack subdomains | required |
 | `--cookie` | `connect.sid` cookie value | `SUBSTACK_SID` env var |
-| `--output-dir` | Output directory | `./output/<subdomain>/` |
+| `--output-dir` | Base output directory (each subdomain gets a subfolder) | `./output/` |
 | `--posts-only` | Skip notes extraction | off |
 | `--notes-only` | Skip posts extraction | off |
 | `--no-content` | Omit body content from CSV | off |
 | `--delay` | Seconds between API requests | `1.0` |
 
-## Output
+## CSV Schemas
 
 ### `posts.csv`
 
@@ -59,11 +74,14 @@ python extract.py mattstoller --output-dir ./my-archive --delay 2.0
 | `id` | Substack internal post ID |
 | `title` | Post title |
 | `subtitle` | Post subtitle |
-| `date` | Publication date (ISO 8601) |
-| `url` | Canonical URL |
+| `date` | Publication timestamp (ISO 8601) |
+| `url` | Canonical URL to the post |
 | `slug` | URL slug |
 | `type` | Post type (newsletter, podcast, etc.) |
 | `audience` | Visibility (everyone, only_paid, etc.) |
+| `is_reply` | Whether this post is a reply to another |
+| `parent_id` | ID of the parent post (if reply) |
+| `parent_url` | URL of the parent post (if reply) |
 | `like_count` | Number of likes |
 | `comment_count` | Number of comments |
 | `reaction_count` | Number of reactions |
@@ -76,12 +94,16 @@ python extract.py mattstoller --output-dir ./my-archive --delay 2.0
 | Column | Description |
 |---|---|
 | `id` | Note ID |
-| `date` | Publication date |
-| `content_text` | Plain text content (omitted with `--no-content`) |
+| `date` | Publication timestamp (ISO 8601) |
+| `url` | URL to the note |
+| `is_reply` | Whether this note is a reply |
+| `is_restack` | Whether this note is a restack of another post/note |
+| `parent_id` | ID of the parent note/post |
+| `parent_url` | URL of the parent note/post |
 | `like_count` | Number of likes |
 | `comment_count` | Number of comments |
 | `restack_count` | Number of restacks |
-| `url` | Note URL |
+| `content_text` | Plain text content (omitted with `--no-content`) |
 
 ## Notes
 
@@ -89,3 +111,4 @@ python extract.py mattstoller --output-dir ./my-archive --delay 2.0
 - The `connect.sid` cookie typically stays valid for months.
 - Excel may truncate cells longer than 32,767 characters. Use `--no-content` for metadata-only exports.
 - This uses Substack's unofficial API, which may change without notice.
+- The notes API field names are less stable than posts. The script tries multiple known patterns and logs response keys for debugging.

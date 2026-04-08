@@ -18,11 +18,11 @@ import requests
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Extract a Substack publication's posts and notes to CSV.",
+        description="Extract Substack publications' posts and notes to CSV.",
     )
-    p.add_argument("subdomain", help="Substack subdomain (e.g. 'mattstoller' for mattstoller.substack.com)")
+    p.add_argument("subdomains", nargs="+", help="One or more Substack subdomains (e.g. 'mattstoller' 'platformer')")
     p.add_argument("--cookie", help="connect.sid cookie value (or set SUBSTACK_SID env var)")
-    p.add_argument("--output-dir", help="Output directory (default: ./output/<subdomain>)")
+    p.add_argument("--output-dir", help="Base output directory (default: ./output/; each subdomain gets its own subfolder)")
     p.add_argument("--posts-only", action="store_true", help="Skip notes extraction")
     p.add_argument("--notes-only", action="store_true", help="Skip posts extraction")
     p.add_argument("--no-content", action="store_true", help="Omit post/note body content from CSV")
@@ -82,12 +82,14 @@ def api_get(session: requests.Session, url: str, params: dict | None = None,
 
 POST_CSV_FIELDS = [
     "id", "title", "subtitle", "date", "url", "slug", "type", "audience",
+    "is_reply", "parent_id", "parent_url",
     "like_count", "comment_count", "reaction_count", "word_count",
     "content_text", "content_html",
 ]
 
 POST_CSV_FIELDS_NO_CONTENT = [
     "id", "title", "subtitle", "date", "url", "slug", "type", "audience",
+    "is_reply", "parent_id", "parent_url",
     "like_count", "comment_count", "reaction_count", "word_count",
 ]
 
@@ -142,15 +144,31 @@ def extract_post_row(post: dict, include_content: bool = True,
 
     content_text = strip_html(body_html) if body_html else ""
 
+    # Parent/reply detection - Substack uses various field names
+    reply_to = (post.get("reply_to_post_id") or post.get("in_reply_to_id")
+                or post.get("reply_to_id") or "")
+    parent_canonical = post.get("reply_to_canonical_url", "") or ""
+    # If reply_to exists but no canonical URL, try to construct one
+    if reply_to and not parent_canonical:
+        reply_slug = post.get("reply_to_slug", "")
+        if reply_slug:
+            pub = post.get("publishedBylines", [{}])
+            pub_domain = pub[0].get("publication", {}).get("subdomain", "") if pub else ""
+            if pub_domain:
+                parent_canonical = f"https://{pub_domain}.substack.com/p/{reply_slug}"
+
     row = {
         "id": post.get("id", ""),
         "title": post.get("title", ""),
         "subtitle": post.get("subtitle", ""),
-        "date": post.get("post_date", ""),
+        "date": post.get("post_date", "") or post.get("publish_date", ""),
         "url": post.get("canonical_url", ""),
         "slug": post.get("slug", ""),
         "type": post.get("type", ""),
         "audience": post.get("audience", ""),
+        "is_reply": bool(reply_to),
+        "parent_id": reply_to,
+        "parent_url": parent_canonical,
         "like_count": post.get("like_count", 0) or 0,
         "comment_count": post.get("comment_count", 0) or 0,
         "reaction_count": post.get("reaction_count", 0) or 0,
@@ -169,12 +187,16 @@ def extract_post_row(post: dict, include_content: bool = True,
 # ---------------------------------------------------------------------------
 
 NOTE_CSV_FIELDS = [
-    "id", "date", "content_text", "like_count", "comment_count",
-    "restack_count", "url",
+    "id", "date", "url",
+    "is_reply", "is_restack", "parent_id", "parent_url",
+    "like_count", "comment_count", "restack_count",
+    "content_text",
 ]
 
 NOTE_CSV_FIELDS_NO_CONTENT = [
-    "id", "date", "like_count", "comment_count", "restack_count", "url",
+    "id", "date", "url",
+    "is_reply", "is_restack", "parent_id", "parent_url",
+    "like_count", "comment_count", "restack_count",
 ]
 
 
@@ -274,13 +296,38 @@ def extract_note_row(note: dict, include_content: bool = True) -> dict:
                                   note.get("body", "") or "")
 
     note_id = note.get("id", "")
+
+    # Parent/reply detection for notes
+    reply_to = (note.get("reply_to_post_id") or note.get("in_reply_to_id")
+                or note.get("reply_to_id") or note.get("reply_comment_id") or "")
+    restacked_id = (note.get("restacked_post_id") or note.get("restack_of_id")
+                    or note.get("reposted_post_id") or "")
+
+    parent_id = reply_to or restacked_id
+    parent_url = (note.get("reply_to_canonical_url", "")
+                  or note.get("restack_canonical_url", "")
+                  or note.get("parent_canonical_url", "") or "")
+
+    # Try to get parent URL from nested objects
+    if not parent_url:
+        parent_comment = note.get("reply_to_comment") or note.get("parent") or {}
+        if isinstance(parent_comment, dict):
+            parent_url = parent_comment.get("canonical_url", "") or ""
+        restacked_post = note.get("restacked_post") or note.get("restack_of") or {}
+        if not parent_url and isinstance(restacked_post, dict):
+            parent_url = restacked_post.get("canonical_url", "") or ""
+
     row = {
         "id": note_id,
         "date": note.get("publish_date", "") or note.get("post_date", ""),
+        "url": note.get("canonical_url", "") or "",
+        "is_reply": bool(reply_to),
+        "is_restack": bool(restacked_id),
+        "parent_id": parent_id,
+        "parent_url": parent_url,
         "like_count": note.get("like_count", 0) or 0,
         "comment_count": note.get("comment_count", 0) or 0,
         "restack_count": note.get("restack_count", 0) or 0,
-        "url": note.get("canonical_url", "") or "",
     }
 
     if include_content:
@@ -366,33 +413,21 @@ def write_csv(rows: list[dict], filepath: str, fieldnames: list[str]):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    args = parse_args()
+def extract_user(session: requests.Session, subdomain: str, out_dir: str,
+                 include_content: bool, delay: float,
+                 posts_only: bool, notes_only: bool):
+    """Extract posts and/or notes for a single subdomain."""
+    print(f"\n{'='*60}", file=sys.stderr)
+    print(f"Extracting: {subdomain}.substack.com", file=sys.stderr)
+    print(f"{'='*60}", file=sys.stderr)
 
-    # Resolve cookie
-    cookie = args.cookie or os.environ.get("SUBSTACK_SID")
-    if not cookie:
-        print("Error: No connect.sid cookie provided.\n"
-              "Use --cookie or set SUBSTACK_SID environment variable.\n\n"
-              "To get your cookie:\n"
-              "  1. Log into Substack in your browser\n"
-              "  2. Open Developer Tools (F12) > Application > Cookies\n"
-              "  3. Copy the 'connect.sid' value",
-              file=sys.stderr)
-        sys.exit(1)
-
-    # Output directory
-    out_dir = args.output_dir or os.path.join("output", args.subdomain)
     os.makedirs(out_dir, exist_ok=True)
-
-    session = get_session(cookie)
-    include_content = not args.no_content
 
     # --- Posts ---
     posts_rows = []
-    if not args.notes_only:
+    if not notes_only:
         try:
-            raw_posts = fetch_posts(session, args.subdomain, args.delay)
+            raw_posts = fetch_posts(session, subdomain, delay)
 
             # Check if archive includes body_html
             needs_individual_fetch = (
@@ -413,11 +448,11 @@ def main():
                     post,
                     include_content=include_content,
                     session=session if needs_individual_fetch else None,
-                    subdomain=args.subdomain,
-                    delay=args.delay,
+                    subdomain=subdomain,
+                    delay=delay,
                 ))
         except Exception as e:
-            print(f"Error fetching posts: {e}", file=sys.stderr)
+            print(f"Error fetching posts for {subdomain}: {e}", file=sys.stderr)
             print(f"Writing {len(posts_rows)} posts collected before failure...",
                   file=sys.stderr)
 
@@ -427,14 +462,14 @@ def main():
 
     # --- Notes ---
     notes_rows = []
-    if not args.posts_only:
+    if not posts_only:
         try:
-            raw_notes = fetch_notes(session, args.subdomain, args.delay)
+            raw_notes = fetch_notes(session, subdomain, delay)
             for note in raw_notes:
                 notes_rows.append(extract_note_row(
                     note, include_content=include_content))
         except Exception as e:
-            print(f"Error fetching notes: {e}", file=sys.stderr)
+            print(f"Error fetching notes for {subdomain}: {e}", file=sys.stderr)
             print(f"Writing {len(notes_rows)} notes collected before failure...",
                   file=sys.stderr)
 
@@ -442,14 +477,53 @@ def main():
             fields = NOTE_CSV_FIELDS_NO_CONTENT if not include_content else NOTE_CSV_FIELDS
             write_csv(notes_rows, os.path.join(out_dir, "notes.csv"), fields)
 
-    # --- Summary ---
-    print(f"\nDone! Output directory: {out_dir}", file=sys.stderr)
+    # --- Summary for this user ---
+    print(f"\nDone with {subdomain}! Output: {out_dir}", file=sys.stderr)
     if posts_rows:
         print(f"  Posts: {len(posts_rows)} entries -> posts.csv", file=sys.stderr)
     if notes_rows:
         print(f"  Notes: {len(notes_rows)} entries -> notes.csv", file=sys.stderr)
     if not posts_rows and not notes_rows:
         print("  No data extracted.", file=sys.stderr)
+
+    return len(posts_rows), len(notes_rows)
+
+
+def main():
+    args = parse_args()
+
+    # Resolve cookie
+    cookie = args.cookie or os.environ.get("SUBSTACK_SID")
+    if not cookie:
+        print("Error: No connect.sid cookie provided.\n"
+              "Use --cookie or set SUBSTACK_SID environment variable.\n\n"
+              "To get your cookie:\n"
+              "  1. Log into Substack in your browser\n"
+              "  2. Open Developer Tools (F12) > Application > Cookies\n"
+              "  3. Copy the 'connect.sid' value",
+              file=sys.stderr)
+        sys.exit(1)
+
+    session = get_session(cookie)
+    include_content = not args.no_content
+    base_dir = args.output_dir or "output"
+
+    results = {}
+    for subdomain in args.subdomains:
+        out_dir = os.path.join(base_dir, subdomain)
+        posts_count, notes_count = extract_user(
+            session, subdomain, out_dir, include_content,
+            args.delay, args.posts_only, args.notes_only,
+        )
+        results[subdomain] = (posts_count, notes_count)
+
+    # Final summary across all users
+    if len(args.subdomains) > 1:
+        print(f"\n{'='*60}", file=sys.stderr)
+        print("Summary:", file=sys.stderr)
+        for subdomain, (pc, nc) in results.items():
+            print(f"  {subdomain}: {pc} posts, {nc} notes -> {base_dir}/{subdomain}/",
+                  file=sys.stderr)
 
 
 if __name__ == "__main__":
