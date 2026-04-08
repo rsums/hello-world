@@ -21,7 +21,7 @@ def parse_args():
         description="Extract Substack publications' posts and notes to CSV.",
     )
     p.add_argument("subdomains", nargs="+", help="One or more Substack subdomains (e.g. 'mattstoller' 'platformer')")
-    p.add_argument("--cookie", help="connect.sid cookie value (or set SUBSTACK_SID env var)")
+    p.add_argument("--cookie", help="substack.sid (or connect.sid) cookie value (or set SUBSTACK_SID env var)")
     p.add_argument("--output-dir", help="Base output directory (default: ./output/; each subdomain gets its own subfolder)")
     p.add_argument("--posts-only", action="store_true", help="Skip notes extraction")
     p.add_argument("--notes-only", action="store_true", help="Skip posts extraction")
@@ -36,6 +36,8 @@ def parse_args():
 
 def get_session(cookie: str) -> requests.Session:
     s = requests.Session()
+    # Set both cookie names - Substack has used both historically
+    s.cookies.set("substack.sid", cookie, domain=".substack.com")
     s.cookies.set("connect.sid", cookie, domain=".substack.com")
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -495,12 +497,12 @@ def main():
     # Resolve cookie
     cookie = args.cookie or os.environ.get("SUBSTACK_SID")
     if not cookie:
-        print("Error: No connect.sid cookie provided.\n"
+        print("Error: No session cookie provided.\n"
               "Use --cookie or set SUBSTACK_SID environment variable.\n\n"
               "To get your cookie:\n"
               "  1. Log into Substack in your browser\n"
               "  2. Open Developer Tools (F12) > Application > Cookies\n"
-              "  3. Copy the 'connect.sid' value",
+              "  3. Copy the 'substack.sid' (or 'connect.sid') value",
               file=sys.stderr)
         sys.exit(1)
 
